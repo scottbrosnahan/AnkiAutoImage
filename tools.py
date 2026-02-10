@@ -220,6 +220,13 @@ class BackfillImagesDialog(QDialog):
 		self._row_nade_sentence.addWidget(self.nade_sentence_field)
 		layout.addLayout(self._row_nade_sentence)
 
+		self._row_nade_sentence_en = QHBoxLayout()
+		self.lbl_nade_sentence_en = QLabel("Sentence EN Field")
+		self._row_nade_sentence_en.addWidget(self.lbl_nade_sentence_en)
+		self.nade_sentence_en_field = QComboBox(self)
+		self._row_nade_sentence_en.addWidget(self.nade_sentence_en_field)
+		layout.addLayout(self._row_nade_sentence_en)
+
 		# Suffix control
 		row_suf = QHBoxLayout()
 		self.lbl_suffix = QLabel("Suffix")
@@ -309,6 +316,7 @@ class BackfillImagesDialog(QDialog):
 				imgf = str(ln.get("image_field", ""))
 				audf = str(ln.get("audio_field", ""))
 				sentf = str(ln.get("sentence_field", ""))
+				sent_enf = str(ln.get("sentence_en_field", ""))
 				if qf:
 					self.query_field.setCurrentIndex(_index_of(qf, self.query_field.currentIndex()))
 				if imgf:
@@ -317,6 +325,8 @@ class BackfillImagesDialog(QDialog):
 					self.nade_audio_field.setCurrentIndex(_index_of(audf, self.nade_audio_field.currentIndex()))
 				if sentf:
 					self.nade_sentence_field.setCurrentIndex(_index_of(sentf, self.nade_sentence_field.currentIndex()))
+				if sent_enf:
+					self.nade_sentence_en_field.setCurrentIndex(_index_of(sent_enf, self.nade_sentence_en_field.currentIndex()))
 			elif mode == "gemini":
 				lgm = last.get("gemini", {}) if isinstance(last.get("gemini"), dict) else {}
 				qf = str(lgm.get("query_field", ""))
@@ -402,6 +412,28 @@ def _nadeshiko_pick_sentence(sentences: List[Dict[str, Any]], term: str) -> Opti
 			continue
 	return best if best is not None else (sentences[0] if sentences else None)
 
+def _nadeshiko_pick_sentence_en(sentences_en: List[Dict[str, Any]], term: str) -> Optional[Dict[str, Any]]:
+	"""Return the sentence item with the longest text content.
+
+	Ignores the search term and prefers the item whose Japanese sentence
+	(content_jp or content_jp_highlight stripped) is longest.
+	"""
+	best = None
+	best_len = -1
+	for it in (sentences_en or []):
+		try:
+			seg = (it or {}).get("segment_info") or {}
+			en = str(seg.get("content_en", ""))
+			hl = _strip_tags(str(seg.get("content_en_highlight", "")))
+			cand = en if len(en) >= len(hl) else hl
+			l = len(cand)
+			if l > best_len:
+				best = it
+				best_len = l
+		except Exception:
+			continue
+	return best if best is not None else (sentences_en[0] if sentences_en else None)
+
 
 def _collect_field_names(self, nids: List[int]) -> List[str]:
 	col = self.mw.col
@@ -450,26 +482,31 @@ def _refresh_field_dropdowns(self) -> None:
 	self.nade_image_field.blockSignals(True)
 	self.nade_audio_field.blockSignals(True)
 	self.nade_sentence_field.blockSignals(True)
+	self.nade_sentence_en_field.blockSignals(True)
 	self.query_field.clear()
 	self.target_field.clear()
 	self.nade_image_field.clear()
 	self.nade_audio_field.clear()
 	self.nade_sentence_field.clear()
+	self.nade_sentence_en_field.clear()
 	self.query_field.addItems(fields)
 	self.target_field.addItems(fields)
 	self.nade_image_field.addItems(fields)
 	self.nade_audio_field.addItems(fields)
 	self.nade_sentence_field.addItems(fields)
+	self.nade_sentence_en_field.addItems(fields)
 	self.query_field.setCurrentIndex(_pick_default(fields, ["Expression", "Front", "Word", "Term"]))
 	self.target_field.setCurrentIndex(_pick_default(fields, ["Picture", "Image", "Images", "Back"]))
 	self.nade_image_field.setCurrentIndex(_pick_default(fields, ["Picture", "Image", "Images", "Back"]))
 	self.nade_audio_field.setCurrentIndex(_pick_default(fields, ["Audio", "Sound", "音声"]))
 	self.nade_sentence_field.setCurrentIndex(_pick_default(fields, ["Sentence", "Text", "Front", "Expression"]))
+	self.nade_sentence_en_field.setCurrentIndex(_pick_default(fields, ["Sentence EN", "Sentence Meaning", "English", "Meaning", "Sentence"]))
 	self.query_field.blockSignals(False)
 	self.target_field.blockSignals(False)
 	self.nade_image_field.blockSignals(False)
 	self.nade_audio_field.blockSignals(False)
 	self.nade_sentence_field.blockSignals(False)
+	self.nade_sentence_en_field.blockSignals(False)
 
 def _toggle_provider_fields(self) -> None:
 	mode = (self.provider_combo.currentText() or "").strip().lower() if hasattr(self, "provider_combo") else "google"
@@ -485,6 +522,7 @@ def _toggle_provider_fields(self) -> None:
 		(self._row_nade_img, self.nade_image_field, self.lbl_nade_img),
 		(self._row_nade_audio, self.nade_audio_field, self.lbl_nade_audio),
 		(self._row_nade_sentence, self.nade_sentence_field, self.lbl_nade_sentence),
+		(self._row_nade_sentence_en, self.nade_sentence_en_field, self.lbl_nade_sentence_en),
 	]:
 		try:
 			combo.setVisible(nade)
@@ -600,11 +638,16 @@ def _on_run(self) -> None:
 				img_field = (self.nade_image_field.currentText().strip() if hasattr(self, "nade_image_field") else target_field)
 				aud_field = (self.nade_audio_field.currentText().strip() if hasattr(self, "nade_audio_field") else target_field)
 				sent_field = (self.nade_sentence_field.currentText().strip() if hasattr(self, "nade_sentence_field") else query_field)
+				sent_en_field = (self.nade_sentence_en_field.currentText().strip() if hasattr(self, "nade_sentence_en_field") else "")
 				lang = str(self.cfg.get("nadeshiko_sentence_lang", "jp")).lower()
 				text = _nade_format_sentence(seg, lang)
+				text_en = _nade_format_sentence(seg, "en")
 				changed_sentence = False
 				if sent_field in note and (replace or not note[sent_field]):
 					note[sent_field] = text
+					changed_sentence = True
+				if sent_en_field and sent_en_field != sent_field and sent_en_field in note and (replace or not note[sent_en_field]):
+					note[sent_en_field] = text_en
 					changed_sentence = True
 				# Normalize URLs as done in the reviewer hotkey path
 				img_url = _nade_normalize_url(media_info.get("path_image", ""), base_url)
@@ -777,6 +820,7 @@ def _on_run(self) -> None:
 				"image_field": (self.nade_image_field.currentText().strip() if hasattr(self, "nade_image_field") else ""),
 				"audio_field": (self.nade_audio_field.currentText().strip() if hasattr(self, "nade_audio_field") else ""),
 				"sentence_field": (self.nade_sentence_field.currentText().strip() if hasattr(self, "nade_sentence_field") else ""),
+				"sentence_en_field": (self.nade_sentence_en_field.currentText().strip() if hasattr(self, "nade_sentence_en_field") else ""),
 			})
 			last["nadeshiko"] = last_nade
 		elif provider_mode == "gemini":
@@ -954,7 +998,13 @@ def quick_add_nadeshiko_for_current_card(mw) -> None:
 				if cand in fields:
 					sentence_field = cand
 					break
-
+		# Determine sentence field, prefer commonly used names, else fall back
+		sentence_en_field = str(last_nade.get("sentence_en_field") or "").strip()
+		if not sentence_en_field:
+			for cand in ["Sentence EN", "Sentence Meaning", "English", "Meaning", "Sentence", "Text", "Front", "Expression", query_field]:
+				if cand in fields:
+					sentence_en_field = cand
+					break
 		if not query_field or not image_field or not audio_field:
 			showWarning("Could not determine fields to update.")
 			return
@@ -990,13 +1040,19 @@ def quick_add_nadeshiko_for_current_card(mw) -> None:
 			showInfo("No Nadeshiko results found.")
 			return
 		item = sentences[0]
+
 		# Always write the sentence text, overwriting existing content
 		updated = False
 		seg = (item or {}).get("segment_info") or {}
 		lang = str(cfg.get("nadeshiko_sentence_lang", "jp")).lower()
+		lang_en = str(cfg.get("nadeshiko_sentence_en_lang", "en")).lower()
 		text = _nade_format_sentence(seg, lang)
+		text_en = _nade_format_sentence(seg, lang_en)
 		if sentence_field and sentence_field in note:
 			note[sentence_field] = text
+			updated = True
+		if sentence_en_field and sentence_en_field in note and sentence_en_field != sentence_field:
+			note[sentence_en_field] = text_en
 			updated = True
 
 		media_info = (item or {}).get("media_info") or {}
