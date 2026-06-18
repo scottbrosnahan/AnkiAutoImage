@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 """
-Anki add-on: Auto Images (Google)
+Anki add-on: Auto Images
 
 Adds two entry points:
-- Tools -> Auto Images (Google) (run over a deck)
-- Browser -> Edit -> Auto Images (Google) (run over selected notes)
+- Tools -> AutoImage -> Run (run over a deck)
+- Tools -> AutoImage -> Settings (edit config)
+- Browser -> Edit -> Auto Images (run over selected notes)
 
 Configuration is read from config.json next to this file.
 """
@@ -30,6 +31,12 @@ def _open_tools_dialog() -> None:
 	dialog.exec()
 
 
+def _open_settings_dialog() -> None:
+	from .tools import SettingsDialog
+	dialog = SettingsDialog(parent=mw)
+	dialog.exec()
+
+
 def _open_browser_dialog(browser) -> None:
 	from .tools import BackfillImagesDialog
 	dialog = BackfillImagesDialog(mw=mw, mode="browser", browser=browser)
@@ -37,9 +44,13 @@ def _open_browser_dialog(browser) -> None:
 
 
 def _setup_tools_menu() -> None:
-	action = QAction("Auto Images (Google)", mw)
-	qconnect(action.triggered, _open_tools_dialog)
-	mw.form.menuTools.addAction(action)
+	menu = mw.form.menuTools.addMenu("AutoImage")
+	run_action = QAction("Run", mw)
+	qconnect(run_action.triggered, _open_tools_dialog)
+	menu.addAction(run_action)
+	settings_action = QAction("Settings", mw)
+	qconnect(settings_action.triggered, _open_settings_dialog)
+	menu.addAction(settings_action)
 
 
 def _setup_browser_menu_with_gui_hooks() -> bool:
@@ -47,12 +58,12 @@ def _setup_browser_menu_with_gui_hooks() -> bool:
 		from aqt import gui_hooks
 
 		def on_browser_menus_init(browser):
-			action = QAction("Auto Images (Google)", browser)
+			action = QAction("Auto Images", browser)
 			qconnect(action.triggered, lambda: _open_browser_dialog(browser))
 			browser.form.menuEdit.addAction(action)
 
 		def on_browser_context_menu(browser, menu):
-			action = QAction("Auto Images (Google)", browser)
+			action = QAction("Auto Images", browser)
 			qconnect(action.triggered, lambda: _open_browser_dialog(browser))
 			menu.addSeparator()
 			menu.addAction(action)
@@ -73,7 +84,7 @@ def _setup_browser_menu_with_legacy_hook() -> None:
 		from anki.hooks import addHook
 
 		def on_browser_setup_menus(browser):
-			action = QAction("Auto Images (Google)", browser)
+			action = QAction("Auto Images", browser)
 			qconnect(action.triggered, lambda: _open_browser_dialog(browser))
 			browser.form.menuEdit.addAction(action)
 			# Context menu on older Anki (fallback)
@@ -103,6 +114,10 @@ def _ensure_user_files_dir() -> None:
 def init_addon() -> None:
 	_ensure_user_files_dir()
 	_setup_tools_menu()
+	try:
+		mw.addonManager.setConfigAction(__name__, _open_settings_dialog)
+	except Exception:
+		pass
 	if not _setup_browser_menu_with_gui_hooks():
 		_setup_browser_menu_with_legacy_hook()
 	# Reviewer hotkey (configurable via config.json -> reviewer_hotkey)
@@ -124,34 +139,41 @@ def init_addon() -> None:
 			if not cfg:
 				with open(cfg_path, "r", encoding="utf-8") as f:
 					cfg = json.load(f)
-				hotkey = str(cfg.get("reviewer_hotkey", hotkey)) or hotkey
-				hotkey2 = str(cfg.get("reviewer_hotkey_nadeshiko", hotkey2)) or hotkey2
-				hotkey3 = str(cfg.get("reviewer_hotkey_genai", hotkey3)) or hotkey3
+			if isinstance(cfg, dict):
+				if "reviewer_hotkey" in cfg:
+					hotkey = str(cfg.get("reviewer_hotkey") or "").strip()
+				if "reviewer_hotkey_nadeshiko" in cfg:
+					hotkey2 = str(cfg.get("reviewer_hotkey_nadeshiko") or "").strip()
+				if "reviewer_hotkey_genai" in cfg:
+					hotkey3 = str(cfg.get("reviewer_hotkey_genai") or "").strip()
 		except Exception:
 			pass
-		sc = QShortcut(QKeySequence(hotkey), mw)
 		from .tools import quick_add_image_for_current_card
-		qconnect(sc.activated, lambda: quick_add_image_for_current_card(mw))
-		# Second hotkey for Nadeshiko image+audio
-		sc2 = QShortcut(QKeySequence(hotkey2), mw)
 		from .tools import quick_add_nadeshiko_for_current_card
-		qconnect(sc2.activated, lambda: quick_add_nadeshiko_for_current_card(mw))
-		# Third hotkey for Google GenAI image generation
-		sc3 = QShortcut(QKeySequence(hotkey3), mw)
 		from .tools import quick_add_google_genai_image_for_current_card
-		qconnect(sc3.activated, lambda: quick_add_google_genai_image_for_current_card(mw))
-		# Ensure shortcuts are global within the app window
-		try:
-			sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
-			sc2.setContext(Qt.ShortcutContext.ApplicationShortcut)
-			sc3.setContext(Qt.ShortcutContext.ApplicationShortcut)
-		except Exception:
-			pass
+
+		def _bind_hotkey(sequence: str, callback):
+			if not sequence:
+				return None
+			shortcut = QShortcut(QKeySequence(sequence), mw)
+			qconnect(shortcut.activated, callback)
+			# Ensure shortcuts are global within the app window
+			try:
+				shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+			except Exception:
+				pass
+			return shortcut
+
+		shortcuts = [
+			_bind_hotkey(hotkey, lambda: quick_add_image_for_current_card(mw)),
+			_bind_hotkey(hotkey2, lambda: quick_add_nadeshiko_for_current_card(mw)),
+			_bind_hotkey(hotkey3, lambda: quick_add_google_genai_image_for_current_card(mw)),
+		]
 		# Keep references to prevent garbage collection
 		try:
 			if not hasattr(mw, "_autoimage_shortcuts"):
 				mw._autoimage_shortcuts = []
-			mw._autoimage_shortcuts.extend([sc, sc2, sc3])
+			mw._autoimage_shortcuts.extend(shortcut for shortcut in shortcuts if shortcut is not None)
 		except Exception:
 			pass
 	except Exception:

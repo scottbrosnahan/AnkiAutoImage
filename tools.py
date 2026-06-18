@@ -4,8 +4,8 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 import re
+import random
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
 try:
 	from zoneinfo import ZoneInfo  # Python 3.9+
 	_TZ_LA = ZoneInfo("America/Los_Angeles")
@@ -13,12 +13,13 @@ except Exception:
 	_TZ_LA = None
 
 from aqt.qt import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QCheckBox, QSpinBox
+from aqt.qt import QDialogButtonBox, QFormLayout, QScrollArea, QWidget
+from aqt.qt import QKeySequence, QKeySequenceEdit, QTabWidget
 from aqt.qt import qconnect
 from aqt import mw
-from aqt.utils import showInfo, showWarning
+from aqt.utils import openLink, showInfo, showWarning
 
 from .logger import get_logger
-from .ddg_api import DuckDuckGoClient, DuckDuckGoError
 from .yahoo_api import YahooImagesClient, YahooImagesError
 from .google_cse import GoogleCSEClient
 try:
@@ -48,7 +49,7 @@ def _read_config() -> Dict[str, Any]:
         if pkg:
             cfg = mw.addonManager.getConfig(pkg)  # type: ignore[attr-defined]
             if isinstance(cfg, dict) and cfg:
-                return cfg
+                return _normalize_config(cfg)
     except Exception:
         pass
     # 2) Fallback to local config.json (defaults)
@@ -56,9 +57,50 @@ def _read_config() -> Dict[str, Any]:
         base_dir = os.path.dirname(__file__)
         config_path = os.path.join(base_dir, "config.json")
         with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return _normalize_config(data if isinstance(data, dict) else {})
     except Exception:
         return {}
+
+
+def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+	out = dict(cfg)
+	out.pop("ddg_locale", None)
+	for key in ("google_api_key", "google_cx", "google_genai_api_key", "nadeshiko_api_key"):
+		value = str(out.get(key, "") or "").strip()
+		if value.upper().startswith("REPLACE_"):
+			out[key] = ""
+	return out
+
+
+def _read_default_config() -> Dict[str, Any]:
+	try:
+		base_dir = os.path.dirname(__file__)
+		config_path = os.path.join(base_dir, "config.json")
+		with open(config_path, "r", encoding="utf-8") as f:
+			data = json.load(f)
+		return data if isinstance(data, dict) else {}
+	except Exception:
+		return {}
+
+
+def _write_config(data: Dict[str, Any]) -> bool:
+	try:
+		pkg = _addon_package_name()
+		if pkg:
+			mw.addonManager.writeConfig(pkg, data)  # type: ignore[attr-defined]
+			return True
+	except Exception:
+		pass
+	try:
+		base_dir = os.path.dirname(__file__)
+		config_path = os.path.join(base_dir, "config.json")
+		with open(config_path, "w", encoding="utf-8") as f:
+			json.dump(data, f, ensure_ascii=False, indent=1)
+			f.write("\n")
+		return True
+	except Exception:
+		return False
 
 
 def _user_files_dir() -> str:
@@ -86,6 +128,421 @@ def _write_last_settings(data: Dict[str, Any]) -> None:
 			json.dump(data, f, ensure_ascii=False, indent=1)
 	except Exception:
 		pass
+
+
+class ProviderOrderWidget(QWidget):
+	def __init__(self, value: Any, parent=None) -> None:
+		super().__init__(parent)
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(0, 0, 0, 0)
+		providers = [str(p).strip().lower() for p in (value or []) if str(p).strip()]
+		self.combos: List[QComboBox] = []
+		for idx in range(3):
+			combo = QComboBox(self)
+			combo.addItem("None", "")
+			combo.addItem("Yahoo", "yahoo")
+			combo.addItem("Google", "google")
+			if idx < len(providers):
+				self._set_combo_data(combo, providers[idx])
+			self.combos.append(combo)
+			layout.addWidget(combo)
+
+	def value(self) -> List[str]:
+		out: List[str] = []
+		for combo in self.combos:
+			val = str(combo.currentData() or "").strip()
+			if val and val not in out:
+				out.append(val)
+		return out
+
+	def set_value(self, value: Any) -> None:
+		providers = [str(p).strip().lower() for p in (value or []) if str(p).strip()]
+		for idx, combo in enumerate(self.combos):
+			self._set_combo_data(combo, providers[idx] if idx < len(providers) else "")
+
+	def _set_combo_data(self, combo: QComboBox, data: str) -> None:
+		for idx in range(combo.count()):
+			if str(combo.itemData(idx) or "") == data:
+				combo.setCurrentIndex(idx)
+				return
+		combo.setCurrentIndex(0)
+
+
+class SettingsDialog(QDialog):
+	_TAB_ORDER = [
+		("General", [
+			"default_replace",
+			"provider_preference",
+			"query_prefix",
+			"query_suffix",
+			"append_photo_suffix",
+		]),
+		("Nadeshiko", [
+			"nadeshiko_api_key",
+			"nadeshiko_min_length",
+			"nadeshiko_max_length",
+			"nadeshiko_sentence_selection",
+			"nadeshiko_image_field",
+			"nadeshiko_audio_field",
+			"nadeshiko_sentence_lang",
+			"nadeshiko_sentence_en_lang",
+			"nadeshiko_sentence_en_field",
+			"nadeshiko_query_suffix",
+		]),
+		("Gemini Image", [
+			"google_genai_api_key",
+			"google_genai_model",
+			"google_genai_aspect_ratio",
+			"google_genai_person_generation",
+			"google_genai_prompt_template",
+		]),
+		("Hotkeys", [
+			"reviewer_hotkey",
+			"reviewer_hotkey_nadeshiko",
+			"reviewer_hotkey_genai",
+		]),
+		("Legacy Google", [
+			"google_api_key",
+			"google_cx",
+		]),
+	]
+	_LABELS = {
+		"default_replace": "Replace existing media by default",
+		"query_prefix": "Search query prefix",
+		"query_suffix": "Search query suffix",
+		"append_photo_suffix": "Append photo suffix",
+		"provider_preference": "Image search provider order",
+		"google_api_key": "Google Custom Search API key",
+		"google_cx": "Google Programmable Search engine ID",
+		"reviewer_hotkey": "Review hotkey: image search",
+		"reviewer_hotkey_nadeshiko": "Review hotkey: Nadeshiko",
+		"reviewer_hotkey_genai": "Review hotkey: Gemini Image",
+		"nadeshiko_api_key": "Nadeshiko API key",
+		"nadeshiko_min_length": "Minimum sentence length",
+		"nadeshiko_max_length": "Maximum sentence length",
+		"nadeshiko_sentence_selection": "Sentence selection",
+		"nadeshiko_image_field": "Default image field",
+		"nadeshiko_audio_field": "Default sentence audio field",
+		"nadeshiko_sentence_lang": "Sentence language",
+		"nadeshiko_sentence_en_lang": "Second sentence language",
+		"nadeshiko_sentence_en_field": "Default second sentence field",
+		"nadeshiko_query_suffix": "Nadeshiko query suffix",
+		"google_genai_api_key": "Gemini API key",
+		"google_genai_model": "Image generation model",
+		"google_genai_aspect_ratio": "Generated image aspect ratio",
+		"google_genai_person_generation": "Person generation policy",
+		"google_genai_prompt_template": "Image prompt template",
+	}
+	_CHOICES = {
+		"nadeshiko_sentence_lang": (
+			True,
+			[
+				("Japanese", "jp"),
+				("English", "en"),
+			],
+		),
+		"nadeshiko_sentence_en_lang": (
+			True,
+			[
+				("English", "en"),
+				("Japanese", "jp"),
+			],
+		),
+		"nadeshiko_sentence_selection": (
+			False,
+			[
+				("Longest", "longest"),
+				("Random", "random"),
+				("Smallest", "smallest"),
+				("Median", "median"),
+			],
+		),
+		"google_genai_model": (
+			True,
+			[
+				("Gemini Image", "gemini-3.1-flash-image"),
+				("Imagen 4", "imagen-4.0-generate-001"),
+				("Imagen 4 Fast", "imagen-4.0-fast-generate-001"),
+			],
+		),
+		"google_genai_aspect_ratio": (
+			False,
+			[
+				("Square", "1:1"),
+				("Portrait", "3:4"),
+				("Landscape", "4:3"),
+				("Tall", "9:16"),
+				("Wide", "16:9"),
+			],
+		),
+		"google_genai_person_generation": (
+			False,
+			[
+				("Allow all", "ALLOW_ALL"),
+				("Allow adults only", "ALLOW_ADULT"),
+				("Do not allow people", "DONT_ALLOW"),
+			],
+		),
+	}
+	_SPIN_RANGES = {
+		"nadeshiko_min_length": (0, 5000, ""),
+		"nadeshiko_max_length": (0, 5000, "No maximum"),
+	}
+	_HOTKEY_KEYS = {
+		"reviewer_hotkey",
+		"reviewer_hotkey_nadeshiko",
+		"reviewer_hotkey_genai",
+	}
+	_PLACEHOLDERS = {
+		"query_prefix": "Optional text before every image-search query",
+		"query_suffix": "Optional text after every image-search query",
+		"google_api_key": "Paste Google Custom Search API key",
+		"google_cx": "Paste Programmable Search engine ID",
+		"nadeshiko_api_key": "Paste Nadeshiko API key",
+		"nadeshiko_image_field": "Blank = choose in Run dialog",
+		"nadeshiko_audio_field": "Blank = choose in Run dialog",
+		"nadeshiko_sentence_en_field": "Blank = auto-detect",
+		"nadeshiko_query_suffix": "Optional text after every Nadeshiko query",
+		"google_genai_api_key": "Paste Gemini API key",
+		"google_genai_prompt_template": "Use {term} for the note text",
+		"reviewer_hotkey": "Ctrl+Shift+G",
+		"reviewer_hotkey_nadeshiko": "Ctrl+Shift+Y",
+		"reviewer_hotkey_genai": "Ctrl+Shift+U",
+	}
+	_HELP_LINKS = {
+		"nadeshiko_api_key": ("Get key", "https://nadeshiko.co/user/developer"),
+		"google_genai_api_key": ("Get key", "https://aistudio.google.com/apikey"),
+		"google_api_key": ("Get key", "https://developers.google.com/custom-search/v1/introduction"),
+		"google_cx": ("Create search engine", "https://programmablesearchengine.google.com/controlpanel/all"),
+	}
+
+	def __init__(self, parent=None) -> None:
+		super().__init__(parent or mw)
+		self.setWindowTitle("AutoImage Settings")
+		self.defaults = _read_default_config()
+		current = _read_config()
+		self.extra_config = {k: v for k, v in current.items() if k not in self.defaults}
+		self.values = dict(self.defaults)
+		self.values.update({k: v for k, v in current.items() if k in self.defaults})
+		self.widgets: Dict[str, Any] = {}
+		self._build_ui()
+
+	def _build_ui(self) -> None:
+		self.setMinimumWidth(720)
+		self.setMinimumHeight(520)
+		layout = QVBoxLayout(self)
+
+		tabs = QTabWidget(self)
+		added: set[str] = set()
+		for title, keys in self._TAB_ORDER:
+			tab, form = self._make_tab()
+			for key in keys:
+				if key in self.defaults:
+					self._add_setting_row(form, key)
+					added.add(key)
+			tabs.addTab(tab, title)
+		advanced_keys = [key for key in self.defaults if key not in added]
+		if advanced_keys:
+			tab, form = self._make_tab()
+			for key in advanced_keys:
+				self._add_setting_row(form, key)
+			tabs.addTab(tab, "Advanced")
+		layout.addWidget(tabs)
+
+		buttons = QDialogButtonBox(
+			QDialogButtonBox.StandardButton.Save
+			| QDialogButtonBox.StandardButton.Cancel
+			| QDialogButtonBox.StandardButton.RestoreDefaults,
+			self,
+		)
+		qconnect(buttons.accepted, self._save)
+		qconnect(buttons.rejected, self.reject)
+		restore = buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults)
+		if restore is not None:
+			qconnect(restore.clicked, self._restore_defaults)
+		layout.addWidget(buttons)
+
+	def _make_tab(self):
+		tab = QWidget(self)
+		layout = QVBoxLayout(tab)
+		scroll = QScrollArea(tab)
+		scroll.setWidgetResizable(True)
+		body = QWidget(scroll)
+		form = QFormLayout(body)
+		form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+		scroll.setWidget(body)
+		layout.addWidget(scroll)
+		return tab, form
+
+	def _add_setting_row(self, form: QFormLayout, key: str) -> None:
+		default = self.defaults[key]
+		value = self.values.get(key, default)
+		widget = self._make_widget(key, default, value)
+		self.widgets[key] = widget
+		label = QLabel(self._label_for(key))
+		label.setToolTip(key)
+		widget.setToolTip(key)
+		form.addRow(label, self._wrap_widget_with_help(key, widget))
+
+	def _label_for(self, key: str) -> str:
+		if key in self._LABELS:
+			return self._LABELS[key]
+		return key.replace("_", " ").capitalize()
+
+	def _make_widget(self, key: str, default: Any, value: Any):
+		value = self._display_value(key, default, value)
+		if key == "provider_preference":
+			return ProviderOrderWidget(value, self)
+		if key in self._CHOICES:
+			editable, choices = self._CHOICES[key]
+			return self._make_choice_widget(value, choices, editable)
+		if key in self._HOTKEY_KEYS:
+			return self._make_hotkey_widget(value)
+		if isinstance(default, bool):
+			widget = QCheckBox(self)
+			widget.setChecked(bool(value))
+			return widget
+		if isinstance(default, int) and not isinstance(default, bool):
+			widget = QSpinBox(self)
+			min_val, max_val, special_text = self._SPIN_RANGES.get(key, (-1000000, 1000000, ""))
+			widget.setRange(min_val, max_val)
+			if special_text:
+				widget.setSpecialValueText(special_text)
+			try:
+				widget.setValue(int(value))
+			except Exception:
+				widget.setValue(default)
+			return widget
+		if isinstance(default, list):
+			widget = QLineEdit(self)
+			if isinstance(value, list):
+				widget.setText(", ".join(str(item) for item in value))
+			else:
+				widget.setText(str(value or ""))
+			self._apply_placeholder(key, widget)
+			return widget
+		widget = QLineEdit(self)
+		widget.setText("" if value is None else str(value))
+		self._apply_placeholder(key, widget)
+		return widget
+
+	def _wrap_widget_with_help(self, key: str, widget):
+		link_info = self._HELP_LINKS.get(key)
+		if not link_info:
+			return widget
+		button_text, url = link_info
+		container = QWidget(self)
+		layout = QHBoxLayout(container)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.addWidget(widget)
+		button = QPushButton(button_text, container)
+		button.setToolTip(url)
+		qconnect(button.clicked, lambda _checked=False, link=url: openLink(link))
+		layout.addWidget(button)
+		return container
+
+	def _display_value(self, key: str, default: Any, value: Any) -> Any:
+		if isinstance(default, str) and _is_placeholder_config_value(str(value)) and str(value).strip().upper().startswith("REPLACE_"):
+			return ""
+		return value
+
+	def _apply_placeholder(self, key: str, widget: QLineEdit) -> None:
+		placeholder = self._PLACEHOLDERS.get(key, "")
+		if placeholder:
+			widget.setPlaceholderText(placeholder)
+
+	def _make_choice_widget(self, value: Any, choices: List[tuple[str, str]], editable: bool) -> QComboBox:
+		widget = QComboBox(self)
+		widget.setEditable(editable)
+		for label, data in choices:
+			widget.addItem(f"{label} ({data})", data)
+		self._set_combo_value(widget, str(value or ""))
+		return widget
+
+	def _make_hotkey_widget(self, value: Any) -> QKeySequenceEdit:
+		widget = QKeySequenceEdit(self)
+		widget.setKeySequence(QKeySequence(str(value or "")))
+		try:
+			widget.setClearButtonEnabled(True)
+		except Exception:
+			pass
+		try:
+			widget.setMaximumSequenceLength(1)
+		except Exception:
+			pass
+		return widget
+
+	def _restore_defaults(self) -> None:
+		for key, default in self.defaults.items():
+			self._set_widget_value(self.widgets[key], default)
+
+	def _set_widget_value(self, widget, value: Any) -> None:
+		value = "" if isinstance(value, str) and value.strip().upper().startswith("REPLACE_") else value
+		if isinstance(widget, ProviderOrderWidget):
+			widget.set_value(value)
+		elif isinstance(widget, QCheckBox):
+			widget.setChecked(bool(value))
+		elif isinstance(widget, QSpinBox):
+			try:
+				widget.setValue(int(value))
+			except Exception:
+				widget.setValue(0)
+		elif isinstance(widget, QKeySequenceEdit):
+			widget.setKeySequence(QKeySequence("" if value is None else str(value)))
+		elif isinstance(widget, QLineEdit):
+			if isinstance(value, list):
+				widget.setText(", ".join(str(item) for item in value))
+			else:
+				widget.setText("" if value is None else str(value))
+		elif isinstance(widget, QComboBox):
+			self._set_combo_value(widget, str(value or ""))
+
+	def _set_combo_value(self, widget: QComboBox, value: str) -> None:
+		for idx in range(widget.count()):
+			if str(widget.itemData(idx) or "") == value:
+				widget.setCurrentIndex(idx)
+				return
+		if widget.isEditable():
+			widget.setEditText(value)
+
+	def _value_from_widget(self, key: str, default: Any) -> Any:
+		widget = self.widgets[key]
+		if isinstance(widget, ProviderOrderWidget):
+			return widget.value()
+		if isinstance(widget, QKeySequenceEdit):
+			return str(widget.keySequence().toString()).strip()
+		if isinstance(widget, QComboBox):
+			idx = widget.currentIndex()
+			text = widget.currentText().strip()
+			if idx >= 0 and text == widget.itemText(idx):
+				data = widget.itemData(idx)
+				if data is not None:
+					return data
+			return "" if text.upper().startswith("REPLACE_") else text
+		if isinstance(default, bool):
+			return bool(widget.isChecked())
+		if isinstance(default, int) and not isinstance(default, bool):
+			return int(widget.value())
+		if isinstance(default, list):
+			raw = widget.text().strip()
+			return [part.strip() for part in raw.split(",") if part.strip()]
+		raw = widget.text()
+		if raw.strip().upper().startswith("REPLACE_"):
+			return ""
+		if default is None:
+			raw = raw.strip()
+			return raw if raw else None
+		return raw
+
+	def _save(self) -> None:
+		data = {k: v for k, v in self.extra_config.items() if k != "ddg_locale"}
+		for key, default in self.defaults.items():
+			data[key] = self._value_from_widget(key, default)
+		if _write_config(data):
+			showInfo("AutoImage settings saved.")
+			self.accept()
+		else:
+			showWarning("Failed to save AutoImage settings.")
 
 
 class BackfillImagesDialog(QDialog):
@@ -138,7 +595,7 @@ class BackfillImagesDialog(QDialog):
 		eta = midnight - now
 		hrs = eta.seconds // 3600
 		mins = (eta.seconds % 3600) // 60
-		return f"Google quota: {used}/100, resets in {hrs:02d}:{mins:02d} (PT)"
+		return f"Legacy Google quota: {used}/100, resets in {hrs:02d}:{mins:02d} (PT)"
 
 	def _increment_google_quota(self, inc: int) -> None:
 		if inc <= 0:
@@ -183,14 +640,27 @@ class BackfillImagesDialog(QDialog):
 		row_p = QHBoxLayout()
 		row_p.addWidget(QLabel("Provider"))
 		self.provider_combo = QComboBox(self)
-		self.provider_combo.addItems(["Google", "Gemini", "Nadeshiko"])
-		default_provider = str(self.cfg.get("ui_default_provider", "Google")).strip().title()
-		if default_provider in ("Google", "Gemini", "Nadeshiko"):
-			self.provider_combo.setCurrentText(default_provider)
+		self.provider_combo.addItems(["Image Search", "Gemini Image", "Nadeshiko"])
+		default_provider_raw = str(self.cfg.get("ui_default_provider", "Image Search")).strip().lower()
+		default_provider = {
+			"google": "Image Search",
+			"google search": "Image Search",
+			"image": "Image Search",
+			"image search": "Image Search",
+			"images": "Image Search",
+			"yahoo": "Image Search",
+			"gemini": "Gemini Image",
+			"gemini image": "Gemini Image",
+			"genai": "Gemini Image",
+			"google genai": "Gemini Image",
+			"imagen": "Gemini Image",
+			"nadeshiko": "Nadeshiko",
+		}.get(default_provider_raw, "Image Search")
+		self.provider_combo.setCurrentText(default_provider)
 		row_p.addWidget(self.provider_combo)
 		layout.addLayout(row_p)
 
-		# Target (Google/Gemini)
+		# Target (Image Search/Gemini Image)
 		row_t = QHBoxLayout()
 		self.lbl_target = QLabel("Target Field")
 		row_t.addWidget(self.lbl_target)
@@ -219,6 +689,13 @@ class BackfillImagesDialog(QDialog):
 		self.nade_sentence_field = QComboBox(self)
 		self._row_nade_sentence.addWidget(self.nade_sentence_field)
 		layout.addLayout(self._row_nade_sentence)
+
+		self._row_nade_sentence_en = QHBoxLayout()
+		self.lbl_nade_sentence_en = QLabel("Sentence EN Field")
+		self._row_nade_sentence_en.addWidget(self.lbl_nade_sentence_en)
+		self.nade_sentence_en_field = QComboBox(self)
+		self._row_nade_sentence_en.addWidget(self.nade_sentence_en_field)
+		layout.addLayout(self._row_nade_sentence_en)
 
 		# Suffix control
 		row_suf = QHBoxLayout()
@@ -279,7 +756,7 @@ class BackfillImagesDialog(QDialog):
 	def _apply_last_settings_for_provider(self) -> None:
 		"""Restore last-used fields per provider when switching providers/opening UI."""
 		try:
-			mode = (self.provider_combo.currentText() or "").strip().lower() if hasattr(self, "provider_combo") else "google"
+			mode = _provider_mode_name(self.provider_combo.currentText() if hasattr(self, "provider_combo") else "google")
 			last = _read_last_settings() or {}
 			fields: List[str] = []
 			# collect current dropdown items
@@ -292,6 +769,11 @@ class BackfillImagesDialog(QDialog):
 					return fields.index(name)
 				except Exception:
 					return default_idx
+			def _set_combo_text(combo: QComboBox, name: str) -> None:
+				for idx in range(combo.count()):
+					if combo.itemText(idx) == name:
+						combo.setCurrentIndex(idx)
+						return
 			if mode == "google":
 				lg = last.get("google", {}) if isinstance(last.get("google"), dict) else {}
 				qf = str(lg.get("query_field", ""))
@@ -309,6 +791,7 @@ class BackfillImagesDialog(QDialog):
 				imgf = str(ln.get("image_field", ""))
 				audf = str(ln.get("audio_field", ""))
 				sentf = str(ln.get("sentence_field", ""))
+				sent_enf = str(ln.get("sentence_en_field", ""))
 				if qf:
 					self.query_field.setCurrentIndex(_index_of(qf, self.query_field.currentIndex()))
 				if imgf:
@@ -317,6 +800,8 @@ class BackfillImagesDialog(QDialog):
 					self.nade_audio_field.setCurrentIndex(_index_of(audf, self.nade_audio_field.currentIndex()))
 				if sentf:
 					self.nade_sentence_field.setCurrentIndex(_index_of(sentf, self.nade_sentence_field.currentIndex()))
+				if sent_enf and hasattr(self, "nade_sentence_en_field"):
+					_set_combo_text(self.nade_sentence_en_field, sent_enf)
 			elif mode == "gemini":
 				lgm = last.get("gemini", {}) if isinstance(last.get("gemini"), dict) else {}
 				qf = str(lgm.get("query_field", ""))
@@ -335,72 +820,132 @@ def _strip_tags(text: str) -> str:
 		return text or ""
 
 
-def _nade_format_sentence(seg: Dict[str, Any], lang_code: str) -> str:
+def _provider_mode_name(value: str) -> str:
+	mode = (value or "google").strip().lower()
+	if mode in ("image", "images", "image search", "google search", "yahoo"):
+		return "google"
+	if mode in ("gemini", "gemini image", "genai", "google genai", "imagen"):
+		return "gemini"
+	return mode
+
+
+def _image_provider_order(cfg: Dict[str, Any]) -> List[str]:
+	raw = cfg.get("provider_preference", ["yahoo"])
+	raw_items = [str(p).strip().lower() for p in (raw or []) if str(p).strip()]
+	out: List[str] = []
+	for provider in raw_items:
+		if provider in ("yahoo", "google") and provider not in out:
+			out.append(provider)
+	return out
+
+
+def _search_yahoo_urls(query: str, max_results: int, client: YahooImagesClient, use_browser_provider: bool, logger=None) -> List[str]:
+	if use_browser_provider and _HAS_PLAYWRIGHT:
+		try:
+			urls = yahoo_images_playwright(query, max_results=max_results)
+			if urls:
+				return urls
+		except Exception as e:
+			if logger is not None:
+				try:
+					logger.error(f"Yahoo browser search failed; falling back to HTTP scraper: {e}")
+				except Exception:
+					pass
+	return client.search_image_urls(query, max_results=max_results)
+
+
+def _image_extension_from_bytes(content: bytes) -> str:
+	if content.startswith(b"\xff\xd8\xff"):
+		return ".jpg"
+	if content.startswith(b"\x89PNG\r\n\x1a\n"):
+		return ".png"
+	if content.startswith(b"GIF87a") or content.startswith(b"GIF89a"):
+		return ".gif"
+	if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+		return ".webp"
+	return ".jpg"
+
+
+def _image_filename_from_url(url: str, fallback_stem: str, content: bytes) -> str:
+	tail = url.split("/")[-1].split("?")[0]
+	safe_tail = ensure_media_filename_safe(tail)
+	_, ext = os.path.splitext(safe_tail)
+	if ext.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"} and len(safe_tail) <= 120:
+		return safe_tail
+	return ensure_media_filename_safe(f"{fallback_stem}{_image_extension_from_bytes(content)}")
+
+
+def _is_placeholder_config_value(value: str) -> bool:
+	text = str(value or "").strip()
+	return not text or text.upper().startswith("REPLACE_")
+
+
+def _nade_format_sentence(segment: Dict[str, Any], lang_code: str) -> str:
 	"""Return sentence text for the requested language, bolding the highlighted term.
 
-	Uses the API's *_highlight field if available (which wraps matches in <em>),
-	and converts <em>..</em> to <b>..</b>. Falls back to plain content if highlight
+	Uses the v2 API format: textJa/textEn/textEs with content and highlight fields.
+	Converts <em>..</em> to <b>..</b>. Falls back to plain content if highlight
 	is missing.
 	"""
 	try:
 		lc = (lang_code or "jp").lower()
-		plain_key = f"content_{'en' if lc=='en' else ('es' if lc=='es' else 'jp')}"
-		hl_key = f"{plain_key}_highlight"
-		hl = str(seg.get(hl_key, "") or "").strip()
+		text_key = f"text{'En' if lc == 'en' else ('Es' if lc == 'es' else 'Ja')}"
+		text_obj = segment.get(text_key) or {}
+		hl = str(text_obj.get("highlight", "") or "").strip()
 		if hl:
 			return hl.replace("<em>", "<b>").replace("</em>", "</b>")
-		return str(seg.get(plain_key, "") or "").strip()
+		return str(text_obj.get("content", "") or "").strip()
 	except Exception:
-		return str(seg.get("content_jp", "") or "").strip()
+		return str((segment.get("textJa") or {}).get("content", "") or "").strip()
 
-def _nade_origin(base_url: str) -> str:
+def _nadeshiko_selection_mode(cfg: Dict[str, Any]) -> str:
+	mode = str(cfg.get("nadeshiko_sentence_selection", "longest") or "longest").strip().lower()
+	aliases = {
+		"short": "smallest",
+		"shortest": "smallest",
+		"small": "smallest",
+		"min": "smallest",
+		"minimum": "smallest",
+		"middle": "median",
+	}
+	mode = aliases.get(mode, mode)
+	return mode if mode in {"longest", "random", "smallest", "median"} else "longest"
+
+
+def _nadeshiko_search_options(cfg: Dict[str, Any]) -> tuple[str, int, str]:
+	mode = _nadeshiko_selection_mode(cfg)
+	if mode == "smallest":
+		return mode, 1, "ASC"
+	if mode == "random":
+		return mode, 10, "RANDOM"
+	if mode == "median":
+		return mode, 25, "NONE"
+	return mode, 1, "DESC"
+
+
+def _nadeshiko_segment_length(segment: Dict[str, Any], lang_code: str) -> int:
 	try:
-		p = urlparse(base_url)
-		if p.scheme and p.netloc:
-			return f"{p.scheme}://{p.netloc}"
+		return len(_strip_tags(_nade_format_sentence(segment, lang_code)))
 	except Exception:
-		pass
-	# Fallback: strip known '/api/...' suffixes
-	base = str(base_url or "").strip()
-	idx = base.find("/api/")
-	return base[:idx] if idx != -1 else base.rstrip("/")
+		return 0
 
 
-def _nade_normalize_url(url: str, base_url: str) -> str:
-	u = str(url or "").strip()
-	if not u:
-		return u
-	# Replace backslashes with forward slashes (API sometimes returns '\\')
-	u = u.replace("\\", "/")
-	if u.startswith("http://") or u.startswith("https://"):
-		return u
-	origin = _nade_origin(base_url)
-	if u.startswith("/"):
-		return f"{origin}{u}"
-	return f"{origin}/{u}"
-
-
-def _nadeshiko_pick_sentence(sentences: List[Dict[str, Any]], term: str) -> Optional[Dict[str, Any]]:
-	"""Return the sentence item with the longest text content.
-
-	Ignores the search term and prefers the item whose Japanese sentence
-	(content_jp or content_jp_highlight stripped) is longest.
-	"""
-	best = None
-	best_len = -1
-	for it in (sentences or []):
+def _nadeshiko_pick_segment(segments: List[Dict[str, Any]], mode: str, lang_code: str = "jp") -> Optional[Dict[str, Any]]:
+	candidates = [seg for seg in (segments or []) if isinstance(seg, dict)]
+	if not candidates:
+		return None
+	mode = mode if mode in {"longest", "random", "smallest", "median"} else "longest"
+	if mode == "random":
 		try:
-			seg = (it or {}).get("segment_info") or {}
-			jp = str(seg.get("content_jp", ""))
-			hl = _strip_tags(str(seg.get("content_jp_highlight", "")))
-			cand = jp if len(jp) >= len(hl) else hl
-			l = len(cand)
-			if l > best_len:
-				best = it
-				best_len = l
+			return random.choice(candidates)
 		except Exception:
-			continue
-	return best if best is not None else (sentences[0] if sentences else None)
+			return candidates[0]
+	ranked = sorted(candidates, key=lambda seg: _nadeshiko_segment_length(seg, lang_code))
+	if mode == "smallest":
+		return ranked[0]
+	if mode == "median":
+		return ranked[len(ranked) // 2]
+	return ranked[-1]
 
 
 def _collect_field_names(self, nids: List[int]) -> List[str]:
@@ -450,34 +995,45 @@ def _refresh_field_dropdowns(self) -> None:
 	self.nade_image_field.blockSignals(True)
 	self.nade_audio_field.blockSignals(True)
 	self.nade_sentence_field.blockSignals(True)
+	self.nade_sentence_en_field.blockSignals(True)
 	self.query_field.clear()
 	self.target_field.clear()
 	self.nade_image_field.clear()
 	self.nade_audio_field.clear()
 	self.nade_sentence_field.clear()
+	self.nade_sentence_en_field.clear()
 	self.query_field.addItems(fields)
 	self.target_field.addItems(fields)
 	self.nade_image_field.addItems(fields)
 	self.nade_audio_field.addItems(fields)
 	self.nade_sentence_field.addItems(fields)
+	self.nade_sentence_en_field.addItem("")
+	self.nade_sentence_en_field.addItems(fields)
 	self.query_field.setCurrentIndex(_pick_default(fields, ["Expression", "Front", "Word", "Term"]))
 	self.target_field.setCurrentIndex(_pick_default(fields, ["Picture", "Image", "Images", "Back"]))
 	self.nade_image_field.setCurrentIndex(_pick_default(fields, ["Picture", "Image", "Images", "Back"]))
 	self.nade_audio_field.setCurrentIndex(_pick_default(fields, ["Audio", "Sound", "音声"]))
 	self.nade_sentence_field.setCurrentIndex(_pick_default(fields, ["Sentence", "Text", "Front", "Expression"]))
+	en_default = 0
+	for pref in ["Sentence EN", "Sentence Meaning", "English", "Meaning"]:
+		if pref in fields:
+			en_default = fields.index(pref) + 1
+			break
+	self.nade_sentence_en_field.setCurrentIndex(en_default)
 	self.query_field.blockSignals(False)
 	self.target_field.blockSignals(False)
 	self.nade_image_field.blockSignals(False)
 	self.nade_audio_field.blockSignals(False)
 	self.nade_sentence_field.blockSignals(False)
+	self.nade_sentence_en_field.blockSignals(False)
 
 def _toggle_provider_fields(self) -> None:
-	mode = (self.provider_combo.currentText() or "").strip().lower() if hasattr(self, "provider_combo") else "google"
+	mode = _provider_mode_name(self.provider_combo.currentText() if hasattr(self, "provider_combo") else "google")
 	nade = mode == "nadeshiko"
 	# Toggle visibility
 	self.target_field.setVisible(not nade)
 	self.lbl_target.setVisible(not nade)
-	# Suffix only for Google
+	# Suffix only for generic image search
 	show_suffix = (mode == "google")
 	self.suffix_field.setVisible(show_suffix)
 	self.lbl_suffix.setVisible(show_suffix)
@@ -485,6 +1041,7 @@ def _toggle_provider_fields(self) -> None:
 		(self._row_nade_img, self.nade_image_field, self.lbl_nade_img),
 		(self._row_nade_audio, self.nade_audio_field, self.lbl_nade_audio),
 		(self._row_nade_sentence, self.nade_sentence_field, self.lbl_nade_sentence),
+		(self._row_nade_sentence_en, self.nade_sentence_en_field, self.lbl_nade_sentence_en),
 	]:
 		try:
 			combo.setVisible(nade)
@@ -494,16 +1051,21 @@ def _toggle_provider_fields(self) -> None:
 
 def _on_run(self) -> None:
 	# Selected mode from UI
-	provider_mode = (self.provider_combo.currentText() or "Google").strip().lower() if hasattr(self, "provider_combo") else "google"
-	provider_order = self.cfg.get("provider_preference", ["ddg"]) or ["ddg"]
-	ddg_client = DuckDuckGoClient(locale=self.cfg.get("ddg_locale", "ja-jp"))
+	provider_mode = _provider_mode_name(self.provider_combo.currentText() if hasattr(self, "provider_combo") else "google")
+	provider_order = _image_provider_order(self.cfg)
 	yahoo_client = YahooImagesClient()
 	google_key = str(self.cfg.get("google_api_key", "")).strip()
 	google_cx = str(self.cfg.get("google_cx", "")).strip()
-	google_client = GoogleCSEClient(google_key, google_cx) if (google_key and google_cx) else None
+	google_configured = not _is_placeholder_config_value(google_key) and not _is_placeholder_config_value(google_cx)
+	google_client = GoogleCSEClient(google_key, google_cx) if google_configured else None
 	if not provider_order:
-		showWarning("No providers available. Enable DDG or Google.")
+		showWarning("No image search providers available. Enable Yahoo or legacy Google.")
 		return
+	if provider_mode == "google":
+		usable_providers = [p for p in provider_order if p == "yahoo" or (p == "google" and google_client is not None)]
+		if not usable_providers:
+			showWarning("Image search has no usable provider. Choose Yahoo, or configure google_api_key and google_cx for legacy Google.")
+			return
 
 	query_field = (self.query_field.currentText().strip() if hasattr(self.query_field, "currentText") else str(self.query_field.text()).strip())
 	target_field = (self.target_field.currentText().strip() if hasattr(self.target_field, "currentText") else str(self.target_field.text()).strip())
@@ -519,7 +1081,7 @@ def _on_run(self) -> None:
 	elif provider_mode == "gemini":
 		genai_key_check = str(self.cfg.get("google_genai_api_key", "")).strip() or os.environ.get("GEMINI_API_KEY", "").strip()
 		if not genai_key_check:
-			showWarning("Gemini is selected, but google_genai_api_key is missing in config.json (or GEMINI_API_KEY env var)")
+			showWarning("Gemini Image is selected, but google_genai_api_key is missing in config.json (or GEMINI_API_KEY env var)")
 			return
 
 	if not query_field:
@@ -549,9 +1111,16 @@ def _on_run(self) -> None:
 	updated = 0
 	empty_queries = 0
 	nade_no_result = 0
+	nade_media_errors = 0
 	media = self.mw.col.media
 	used_urls: set[str] = set()
 	google_used_in_run = 0
+	google_error: Optional[str] = None
+	image_search_failures = 0
+	image_search_no_results = 0
+	image_search_skipped_existing = 0
+	image_search_missing_target = 0
+	image_search_last_error: Optional[str] = None
 	for i, nid in enumerate(nids):
 		note = col.get_note(nid)
 		q = get_field_value(note, query_field)
@@ -564,7 +1133,7 @@ def _on_run(self) -> None:
 		prefix = self.cfg.get("query_prefix", "")
 		suffix = self.cfg.get("query_suffix", "")
 		query_text = f"{prefix}{q}{suffix}".strip()
-		# Suffix from UI (apply only to Google image search)
+		# Suffix from UI (apply only to generic image search)
 		ui_suffix = (self.suffix_field.text().strip() if hasattr(self, "suffix_field") else "") or "イラスト"
 		if provider_mode == "google" and ui_suffix and ui_suffix not in query_text:
 			query_text = f"{query_text} {ui_suffix}".strip()
@@ -578,37 +1147,44 @@ def _on_run(self) -> None:
 				key = str(self.cfg.get("nadeshiko_api_key", "")).strip()
 				if not key:
 					continue
-				base_url = str(self.cfg.get("nadeshiko_base_url", "https://api.brigadasos.xyz/api/v1")).strip() or "https://api.brigadasos.xyz/api/v1"
+				base_url = str(self.cfg.get("nadeshiko_base_url", "https://api.nadeshiko.co/v1")).strip() or "https://api.nadeshiko.co/v1"
 				client = NadeshikoApiClient(key, base_url=base_url)
-				# Ask API for the longest sentence, with a sensible minimum length
 				min_len = int(self.cfg.get("nadeshiko_min_length", 6))
 				max_len = int(self.cfg.get("nadeshiko_max_length", 0)) or None
-				res = client.search_sentences(
+				selection_mode, search_take, search_sort = _nadeshiko_search_options(self.cfg)
+				res = client.search(
 					query=query_text,
-					limit=1,
-					content_sort="DESC",
+					take=search_take,
+					sort_mode=search_sort,
 					min_length=min_len,
 					max_length=max_len,
 				)
-				sentences = (res or {}).get("sentences") or []
-				if not sentences:
+				segments = (res or {}).get("segments") or []
+				if not segments:
 					nade_no_result += 1
 					continue
-				it = sentences[0]
-				seg = (it or {}).get("segment_info") or {}
-				media_info = (it or {}).get("media_info") or {}
+				lang = str(self.cfg.get("nadeshiko_sentence_lang", "jp")).lower()
+				segment = _nadeshiko_pick_segment(segments, selection_mode, lang)
+				if not segment:
+					nade_no_result += 1
+					continue
+				urls = segment.get("urls") or {}
 				img_field = (self.nade_image_field.currentText().strip() if hasattr(self, "nade_image_field") else target_field)
 				aud_field = (self.nade_audio_field.currentText().strip() if hasattr(self, "nade_audio_field") else target_field)
 				sent_field = (self.nade_sentence_field.currentText().strip() if hasattr(self, "nade_sentence_field") else query_field)
-				lang = str(self.cfg.get("nadeshiko_sentence_lang", "jp")).lower()
-				text = _nade_format_sentence(seg, lang)
+				sent_en_field = (self.nade_sentence_en_field.currentText().strip() if hasattr(self, "nade_sentence_en_field") else "")
+				lang_en = str(self.cfg.get("nadeshiko_sentence_en_lang", "en")).lower()
+				text = _nade_format_sentence(segment, lang)
+				text_en = _nade_format_sentence(segment, lang_en)
 				changed_sentence = False
 				if sent_field in note and (replace or not note[sent_field]):
 					note[sent_field] = text
 					changed_sentence = True
-				# Normalize URLs as done in the reviewer hotkey path
-				img_url = _nade_normalize_url(media_info.get("path_image", ""), base_url)
-				audio_url = _nade_normalize_url(media_info.get("path_audio", ""), base_url)
+				if sent_en_field in note and sent_en_field != sent_field and text_en and (replace or not note[sent_en_field]):
+					note[sent_en_field] = text_en
+					changed_sentence = True
+				img_url = str(urls.get("imageUrl", "") or "").strip()
+				audio_url = str(urls.get("audioUrl", "") or "").strip()
 				# Download media independently so a failure in one does not prevent sentence-only updates
 				if img_url and img_field in note:
 					try:
@@ -618,6 +1194,7 @@ def _on_run(self) -> None:
 						if add_image_to_note(note, img_field, media_name_img, replace=replace):
 							note_changed = True
 					except Exception as e:
+						nade_media_errors += 1
 						self.logger.error(f"Nadeshiko image download failed for '{q}': {e}")
 				if audio_url and aud_field in note:
 					try:
@@ -627,6 +1204,7 @@ def _on_run(self) -> None:
 						if add_audio_to_note(note, aud_field, media_name_aud, replace=replace):
 							note_changed = True
 					except Exception as e:
+						nade_media_errors += 1
 						self.logger.error(f"Nadeshiko audio download failed for '{q}': {e}")
 				if changed_sentence:
 					note_changed = True
@@ -642,7 +1220,7 @@ def _on_run(self) -> None:
 				key = str(self.cfg.get("google_genai_api_key", "")).strip() or os.environ.get("GEMINI_API_KEY", "").strip()
 				if not key:
 					raise Exception("Missing google_genai_api_key or GEMINI_API_KEY")
-				model = str(self.cfg.get("google_genai_model", "models/imagen-4.0-fast-generate-001"))
+				model = str(self.cfg.get("google_genai_model", "gemini-3.1-flash-image"))
 				aspect_ratio = str(self.cfg.get("google_genai_aspect_ratio", "1:1"))
 				person_generation = str(self.cfg.get("google_genai_person_generation", "ALLOW_ALL"))
 				prompt_tmpl = str(self.cfg.get("google_genai_prompt_template", "create an image to demonstrate the meaning of {term}"))
@@ -652,70 +1230,44 @@ def _on_run(self) -> None:
 					prompt=prompt,
 					model=model,
 					number_of_images=1,
-					output_mime_type="image/jpeg",
+					output_mime_type="image/png",
 					person_generation=person_generation,
 					aspect_ratio=aspect_ratio,
 				)
 				if imgs:
 					content = imgs[0]
-					filename_hint = ensure_media_filename_safe(f"genai_{nid}.jpg")
+					filename_hint = ensure_media_filename_safe(f"genai_{nid}.png")
 				else:
-					raise Exception("No image returned by Gemini")
+					raise Exception("No image returned by Gemini Image")
 			except Exception as e:
 				last_error = f"GenAI: {e}"
-				showWarning(f"Gemini error: {e}")
+				showWarning(f"Gemini Image error: {e}")
 		else:
 			for provider in provider_order:
-				if provider == "ddg":
+				if provider == "yahoo":
 					try:
-						items = ddg_client.search_images(query_text, max_results=50)
-						if items:
-							candidates = [(it.get("image") or "").strip() for it in items]
-							candidates = [u for u in candidates if u]
-							if not candidates:
-								raise Exception("no image url")
-							start = nid % len(candidates)
-							pick = None
-							for off in range(len(candidates)):
-								cand = candidates[(start + off) % len(candidates)]
-								if cand not in used_urls:
-									pick = cand
-									break
-							if pick is None:
-								pick = candidates[start]
-							content = ddg_client.download_image(pick)
-							# Derive filename from URL tail
-							tail = pick.split("/")[-1].split("?")[0]
-							if not tail or "." not in tail:
-								tail = f"ddg_{nid}.jpg"
-							filename_hint = ensure_media_filename_safe(tail)
-							used_urls.add(pick)
-							break
-					except Exception as e:
-						last_error = f"DDG: {e}"
-				elif provider == "yahoo":
-					try:
-						urls = []
-						if _HAS_PLAYWRIGHT and self.cfg.get("use_browser_provider", True):
-							urls = yahoo_images_playwright(query_text, max_results=50)
+						urls = _search_yahoo_urls(
+							query_text,
+							max_results=50,
+							client=yahoo_client,
+							use_browser_provider=bool(self.cfg.get("use_browser_provider", True)),
+							logger=self.logger,
+						)
 						if not urls:
-							urls = yahoo_client.search_image_urls(query_text, max_results=50)
-						if urls:
-							start = nid % len(urls)
-							pick = None
-							for off in range(len(urls)):
-								cand = urls[(start + off) % len(urls)]
-								if cand not in used_urls:
-									pick = cand
-									break
-							if pick is None:
-								pick = urls[start]
-							content = yahoo_client.download_image(pick)
-							# Derive filename from URL tail
-							tail = pick.split("/")[-1].split("?")[0] or f"yahoo_{nid}.jpg"
-							filename_hint = ensure_media_filename_safe(tail)
-							used_urls.add(pick)
-							break
+							raise Exception("no usable Yahoo image result")
+						start = nid % len(urls)
+						pick = None
+						for off in range(len(urls)):
+							cand = urls[(start + off) % len(urls)]
+							if cand not in used_urls:
+								pick = cand
+								break
+						if pick is None:
+							pick = urls[start]
+						content = yahoo_client.download_image(pick)
+						filename_hint = _image_filename_from_url(pick, f"yahoo_{nid}", content)
+						used_urls.add(pick)
+						break
 					except Exception as e:
 						last_error = f"Yahoo: {e}"
 				elif provider == "google" and google_client is not None:
@@ -742,23 +1294,34 @@ def _on_run(self) -> None:
 							google_used_in_run += 1
 							break
 					except Exception as e:
+						google_error = str(e)
 						last_error = f"Google: {e}"
 
 		if content is None or filename_hint is None:
 			if last_error:
 				self.logger.error(f"All providers failed for '{q}': {last_error}")
+				if provider_mode == "google":
+					image_search_failures += 1
+					image_search_last_error = last_error
+			elif provider_mode == "google":
+				image_search_no_results += 1
 			continue
 
 		media_name = media.write_data(filename_hint, content)
-		# For generator providers (Gemini), force replace to ensure a visible result
+		# For generator providers (Gemini Image), force replace to ensure a visible result
 		replace_eff = replace if provider_mode == "google" else True
 		if add_image_to_note(note, target_field, media_name, replace=replace_eff):
 			note.flush()
 			updated += 1
+		elif provider_mode == "google":
+			if target_field not in note:
+				image_search_missing_target += 1
+			else:
+				image_search_skipped_existing += 1
 
 	# Save last used UI settings for reviewer hotkey
 	try:
-		provider_mode = (self.provider_combo.currentText() or "Google").strip().lower() if hasattr(self, "provider_combo") else "google"
+		provider_mode = _provider_mode_name(self.provider_combo.currentText() if hasattr(self, "provider_combo") else "google")
 		last = _read_last_settings()
 		last = last or {}
 		# Store per-provider
@@ -777,6 +1340,7 @@ def _on_run(self) -> None:
 				"image_field": (self.nade_image_field.currentText().strip() if hasattr(self, "nade_image_field") else ""),
 				"audio_field": (self.nade_audio_field.currentText().strip() if hasattr(self, "nade_audio_field") else ""),
 				"sentence_field": (self.nade_sentence_field.currentText().strip() if hasattr(self, "nade_sentence_field") else ""),
+				"sentence_en_field": (self.nade_sentence_en_field.currentText().strip() if hasattr(self, "nade_sentence_en_field") else ""),
 			})
 			last["nadeshiko"] = last_nade
 		elif provider_mode == "gemini":
@@ -797,7 +1361,26 @@ def _on_run(self) -> None:
 	if google_used_in_run:
 		self._increment_google_quota(google_used_in_run)
 		self.quota_label.setText(self._get_quota_display())
-	if provider_mode == "nadeshiko" and updated == 0:
+	if provider_mode == "google" and updated == 0:
+		msg = "Updated 0 notes."
+		if image_search_failures:
+			msg += f" Image search failed for {image_search_failures} note(s)."
+		if image_search_last_error:
+			msg += f" Last error: {image_search_last_error}."
+		elif google_error:
+			msg += f" Google Custom Search failed: {google_error}."
+		if image_search_no_results:
+			msg += f" No image results for {image_search_no_results} note(s)."
+		if image_search_skipped_existing:
+			msg += f" Target field already had media for {image_search_skipped_existing} note(s); enable Replace existing to overwrite it."
+		if image_search_missing_target:
+			msg += f" Target field was missing on {image_search_missing_target} note(s)."
+		if empty_queries:
+			msg += f" Empty query field on {empty_queries} note(s)."
+		showWarning(msg)
+	elif provider_mode == "nadeshiko" and nade_media_errors:
+		showWarning(f"Updated {updated} notes. Nadeshiko media failed for {nade_media_errors} download(s); see user_files/auto-image.log.")
+	elif provider_mode == "nadeshiko" and updated == 0:
 		msg = "Updated 0 notes."
 		if nade_no_result:
 			msg += f" No Nadeshiko results for {nade_no_result} note(s)."
@@ -837,7 +1420,7 @@ def _increment_google_quota_global(inc: int) -> None:
 
 
 def quick_add_image_for_current_card(mw) -> None:
-	"""Add a Google image to the current reviewer card using last-used/default settings.
+	"""Add an image-search result to the current reviewer card using last-used/default settings.
 
 	Always overwrites the target field. Uses saved query/target/suffix if available.
 	"""
@@ -878,29 +1461,62 @@ def quick_add_image_for_current_card(mw) -> None:
 		if suffix_value and suffix_value not in query_text:
 			query_text = f"{query_text} {suffix_value}".strip()
 
+		provider_order = _image_provider_order(cfg)
 		key = str(cfg.get("google_api_key", "")).strip()
 		cx = str(cfg.get("google_cx", "")).strip()
-		if not key or not cx:
-			showWarning("Google API key or CX missing in config.json")
+		google_configured = not _is_placeholder_config_value(key) and not _is_placeholder_config_value(cx)
+		usable_providers = [p for p in provider_order if p == "yahoo" or (p == "google" and google_configured)]
+		if not usable_providers:
+			showWarning("Image search has no usable provider. Choose Yahoo, or configure google_api_key and google_cx for legacy Google.")
 			return
 
-		client = GoogleCSEClient(key, cx)
-		items = client.search_images(query_text, num=10, lr="lang_ja")
-		if not items:
-			showInfo("No images found.")
+		yahoo_client = YahooImagesClient()
+		google_client = GoogleCSEClient(key, cx) if google_configured else None
+		content: Optional[bytes] = None
+		filename_hint: Optional[str] = None
+		last_error: Optional[str] = None
+		google_used = False
+		for provider in provider_order:
+			if provider == "yahoo":
+				try:
+					urls = _search_yahoo_urls(
+						query_text,
+						max_results=10,
+						client=yahoo_client,
+						use_browser_provider=bool(cfg.get("use_browser_provider", True)),
+						logger=None,
+					)
+					link = str((urls[0] if urls else "") or "").strip()
+					if not link:
+						raise Exception("no usable Yahoo image result")
+					content = yahoo_client.download_image(link)
+					filename_hint = _image_filename_from_url(link, "yahoo", content)
+					break
+				except Exception as e:
+					last_error = f"Yahoo: {e}"
+			elif provider == "google" and google_client is not None:
+				try:
+					items = google_client.search_images(query_text, num=10, lr="lang_ja")
+					link = str((items[0].get("link") if items else "") or "").strip()
+					if not link:
+						raise Exception("no usable Google image result")
+					referer = items[0].get("image", {}).get("contextLink") or items[0].get("displayLink") or "https://www.google.com/"
+					content = google_client.download_image(link, referer=referer)
+					tail = link.split("/")[-1].split("?")[0] or "google.jpg"
+					filename_hint = ensure_media_filename_safe(tail)
+					google_used = True
+					break
+				except Exception as e:
+					last_error = f"Google: {e}"
+
+		if content is None or filename_hint is None:
+			showWarning(f"Image search failed: {last_error or 'No images found.'}")
 			return
-		link = str(items[0].get("link") or "").strip()
-		if not link:
-			showInfo("No usable image link found.")
-			return
-		referer = items[0].get("image", {}).get("contextLink") or items[0].get("displayLink") or "https://www.google.com/"
-		content = client.download_image(link, referer=referer)
-		tail = link.split("/")[-1].split("?")[0] or "google.jpg"
-		filename_hint = ensure_media_filename_safe(tail)
 		media_name = col.media.write_data(filename_hint, content)
 		if add_image_to_note(note, target_field, media_name, replace=True):
 			note.flush()
-			_increment_google_quota_global(1)
+			if google_used:
+				_increment_google_quota_global(1)
 			col.reset()
 			mw.reset()
 			showInfo("Image added to current card.")
@@ -914,7 +1530,6 @@ def quick_add_nadeshiko_for_current_card(mw) -> None:
 	Always overwrites the target image/audio fields. Uses saved query/target/suffix if available.
 	Config keys used:
 	- nadeshiko_api_key
-	- nadeshiko_base_url (optional)
 	- nadeshiko_image_field (fallback to last target field)
 	- nadeshiko_audio_field (fallback to "Audio"/"Sound"/target field)
 	- nadeshiko_query_suffix (optional; e.g., none)
@@ -954,6 +1569,12 @@ def quick_add_nadeshiko_for_current_card(mw) -> None:
 				if cand in fields:
 					sentence_field = cand
 					break
+		sentence_en_field = str(last_nade.get("sentence_en_field") or cfg.get("nadeshiko_sentence_en_field", "")).strip()
+		if not sentence_en_field:
+			for cand in ["Sentence EN", "Sentence Meaning", "English", "Meaning"]:
+				if cand in fields:
+					sentence_en_field = cand
+					break
 
 		if not query_field or not image_field or not audio_field:
 			showWarning("Could not determine fields to update.")
@@ -968,40 +1589,47 @@ def quick_add_nadeshiko_for_current_card(mw) -> None:
 		if not key:
 			showWarning("Missing nadeshiko_api_key in config.json")
 			return
-		base_url = str(cfg.get("nadeshiko_base_url", "https://api.brigadasos.xyz/api/v1")).strip() or "https://api.brigadasos.xyz/api/v1"
+		base_url = str(cfg.get("nadeshiko_base_url", "https://api.nadeshiko.co/v1")).strip() or "https://api.nadeshiko.co/v1"
 		client = NadeshikoApiClient(key, base_url=base_url)
 
 		# Optional suffix
 		suffix_cfg = str(cfg.get("nadeshiko_query_suffix", "")).strip()
 		query_text = f"{q_text} {suffix_cfg}".strip() if suffix_cfg else q_text
 
-		# Ask API for the longest sentence, with a sensible minimum length
 		min_len = int(cfg.get("nadeshiko_min_length", 6))
 		max_len = int(cfg.get("nadeshiko_max_length", 0)) or None
-		data = client.search_sentences(
+		selection_mode, search_take, search_sort = _nadeshiko_search_options(cfg)
+		data = client.search(
 			query=query_text,
-			limit=1,
-			content_sort="DESC",
+			take=search_take,
+			sort_mode=search_sort,
 			min_length=min_len,
 			max_length=max_len,
 		)
-		sentences = (data or {}).get("sentences") or []
-		if not sentences:
+		segments = (data or {}).get("segments") or []
+		if not segments:
 			showInfo("No Nadeshiko results found.")
 			return
-		item = sentences[0]
 		# Always write the sentence text, overwriting existing content
 		updated = False
-		seg = (item or {}).get("segment_info") or {}
 		lang = str(cfg.get("nadeshiko_sentence_lang", "jp")).lower()
-		text = _nade_format_sentence(seg, lang)
+		lang_en = str(cfg.get("nadeshiko_sentence_en_lang", "en")).lower()
+		segment = _nadeshiko_pick_segment(segments, selection_mode, lang)
+		if not segment:
+			showInfo("No Nadeshiko results found.")
+			return
+		text = _nade_format_sentence(segment, lang)
+		text_en = _nade_format_sentence(segment, lang_en)
 		if sentence_field and sentence_field in note:
 			note[sentence_field] = text
 			updated = True
+		if sentence_en_field and sentence_en_field in note and sentence_en_field != sentence_field and text_en:
+			note[sentence_en_field] = text_en
+			updated = True
 
-		media_info = (item or {}).get("media_info") or {}
-		img_url = _nade_normalize_url(media_info.get("path_image", ""), base_url)
-		audio_url = _nade_normalize_url(media_info.get("path_audio", ""), base_url)
+		urls = segment.get("urls") or {}
+		img_url = str(urls.get("imageUrl", "") or "").strip()
+		audio_url = str(urls.get("audioUrl", "") or "").strip()
 
 		media = col.media
 		# Download and add image
@@ -1078,7 +1706,7 @@ def quick_add_google_genai_image_for_current_card(mw) -> None:
 		if not api_key:
 			showWarning("Missing google_genai_api_key in config.json")
 			return
-		model = str(cfg.get("google_genai_model", "models/imagen-4.0-fast-generate-001"))
+		model = str(cfg.get("google_genai_model", "gemini-3.1-flash-image"))
 		aspect_ratio = str(cfg.get("google_genai_aspect_ratio", "1:1"))
 		person_generation = str(cfg.get("google_genai_person_generation", "ALLOW_ALL"))
 		prompt_tmpl = str(cfg.get("google_genai_prompt_template", "create an image to demonstrate the meaning of {term}"))
@@ -1089,7 +1717,7 @@ def quick_add_google_genai_image_for_current_card(mw) -> None:
 			prompt=prompt,
 			model=model,
 			number_of_images=1,
-			output_mime_type="image/jpeg",
+			output_mime_type="image/png",
 			person_generation=person_generation,
 			aspect_ratio=aspect_ratio,
 		)
@@ -1097,7 +1725,7 @@ def quick_add_google_genai_image_for_current_card(mw) -> None:
 			showInfo("No image generated.")
 			return
 		img_bytes = images[0]
-		filename_hint = ensure_media_filename_safe("genai.jpg")
+		filename_hint = ensure_media_filename_safe("genai.png")
 		media_name = col.media.write_data(filename_hint, img_bytes)
 		if add_image_to_note(note, target_field, media_name, replace=True):
 			note.flush()

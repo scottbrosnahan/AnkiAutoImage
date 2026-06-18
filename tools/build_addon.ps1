@@ -1,6 +1,6 @@
 Param(
     [string]$Package = 'AnkiAutoImage',
-    [string]$Name = 'Auto Images (Google/Nadeshiko/GenAI)',
+    [string]$Name = 'Auto Images',
     [string]$Homepage = 'https://ankiweb.net/shared/addons/',
     [string]$Output = 'AnkiAutoImage.ankiaddon',
     [switch]$SkipVendor
@@ -29,9 +29,9 @@ Remove-Item $stage -Recurse -Force -ErrorAction Ignore
 New-Item $stage -ItemType Directory | Out-Null
 
 $files = @(
-  '__init__.py','tools.py','anki_util.py','ddg_api.py','yahoo_api.py',
+  '__init__.py','tools.py','anki_util.py','yahoo_api.py',
   'google_cse.py','google_genai.py','nadeshiko_api.py','pexels_api.py',
-  'browser_provider.py','logger.py','config.json','README.md','nadeshiko-api.json'
+  'browser_provider.py','logger.py','config.json','README.md'
 )
 foreach ($f in $files) { Copy-Item $f -Destination $stage }
 if (Test-Path 'vendor') { Copy-Item 'vendor' -Destination $stage -Recurse }

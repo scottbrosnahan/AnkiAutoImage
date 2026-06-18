@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
+
+
+_DOWNLOAD_USER_AGENT = (
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+	"AppleWebKit/537.36 (KHTML, like Gecko) "
+	"Chrome/125.0 Safari/537.36"
+)
 
 
 class NadeshikoApiError(Exception):
@@ -11,59 +19,61 @@ class NadeshikoApiError(Exception):
 
 
 class NadeshikoApiClient:
-	"""Client for the Nadeshiko sentence/media API.
+	"""Client for the Nadeshiko segment search API (v2).
 
 	OpenAPI summary:
-	- Base URL example: https://api.brigadasos.xyz/api/v1
-	- POST /search/media/sentence { query, limit, ... }
-	- Response contains "sentences" list with media_info (path_image, path_audio, path_video)
-	- Auth: header X-API-Key: <key>
+	- Base URL example: https://api.nadeshiko.co/v1
+	- POST /search { query: {search}, take, sort, filters, ... }
+	- Response contains "segments" list with urls (imageUrl, audioUrl, videoUrl)
+	- Auth: header Authorization: Bearer <key>
 	"""
 
-	def __init__(self, api_key: str, base_url: str = "https://api.brigadasos.xyz/api/v1") -> None:
+	def __init__(self, api_key: str, base_url: str = "https://api.nadeshiko.co/v1") -> None:
 		if not api_key:
 			raise NadeshikoApiError("Missing Nadeshiko API key")
 		self._base_url = base_url.rstrip("/")
+		self._base_host = (urlparse(self._base_url).hostname or "").lower()
+		self._auth_header = f"Bearer {api_key}"
 		self._session = requests.Session()
 		self._session.headers.update({
-			"X-API-Key": api_key,
+			"Authorization": self._auth_header,
 			"Content-Type": "application/json",
 			"Accept": "application/json",
 		})
 
-	def search_sentences(
+	def search(
 		self,
 		query: str,
-		limit: int = 1,
-		category: Optional[int] = None,
-		anime_id: Optional[int] = None,
-		season: Optional[List[int]] = None,
-		episode: Optional[List[int]] = None,
-		content_sort: Optional[str] = None,
+		take: int = 1,
+		sort_mode: Optional[str] = None,
 		min_length: Optional[int] = None,
 		max_length: Optional[int] = None,
-		random_seed: Optional[float] = None,
+		category: Optional[List[str]] = None,
+		media_include: Optional[List[str]] = None,
 		timeout: float = 30.0,
 	) -> Dict[str, Any]:
-		payload: Dict[str, Any] = {"query": query, "limit": max(1, limit)}
-		if category is not None:
-			payload["category"] = category
-		if anime_id is not None:
-			payload["anime_id"] = anime_id
-		if season:
-			payload["season"] = season
-		if episode:
-			payload["episode"] = episode
-		if content_sort in ("ASC", "DESC"):
-			payload["content_sort"] = content_sort
-		if isinstance(min_length, int) and min_length > 0:
-			payload["min_length"] = int(min_length)
-		if isinstance(max_length, int) and max_length > 0:
-			payload["max_length"] = int(max_length)
-		if random_seed is not None:
-			payload["random_seed"] = random_seed
+		payload: Dict[str, Any] = {
+			"query": {"search": query},
+			"take": max(1, take),
+		}
+		if sort_mode in ("ASC", "DESC", "NONE", "TIME_ASC", "TIME_DESC", "RANDOM"):
+			payload["sort"] = {"mode": sort_mode}
+		filters: Dict[str, Any] = {}
+		if isinstance(min_length, int) and min_length > 0 or isinstance(max_length, int) and max_length > 0:
+			length_filter: Dict[str, int] = {}
+			if isinstance(min_length, int) and min_length > 0:
+				length_filter["min"] = min_length
+			if isinstance(max_length, int) and max_length > 0:
+				length_filter["max"] = max_length
+			filters["segmentLengthChars"] = length_filter
+		if category:
+			filters["category"] = category
+		if media_include:
+			filters["media"] = {"include": [{"mediaId": mid} for mid in media_include]}
+		if filters:
+			payload["filters"] = filters
 
-		url = f"{self._base_url}/search/media/sentence"
+		url = f"{self._base_url}/search"
 		resp = self._session.post(url, data=json.dumps(payload), timeout=timeout)
 		if resp.status_code != 200:
 			raise NadeshikoApiError(f"HTTP {resp.status_code}: {resp.text}")
@@ -71,8 +81,10 @@ class NadeshikoApiClient:
 		return data or {}
 
 	def download(self, url: str, timeout: float = 60.0) -> bytes:
-		resp = self._session.get(url, timeout=timeout)
+		headers = {"User-Agent": _DOWNLOAD_USER_AGENT, "Accept": "*/*"}
+		host = (urlparse(url).hostname or "").lower()
+		if host == self._base_host or host.endswith(".nadeshiko.co"):
+			headers["Authorization"] = self._auth_header
+		resp = requests.get(url, headers=headers, timeout=timeout)
 		resp.raise_for_status()
 		return resp.content
-
-
